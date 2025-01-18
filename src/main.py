@@ -13,8 +13,8 @@ from sklearn.decomposition import PCA
 from transformers import T5Tokenizer, T5ForConditionalGeneration, MarianMTModel, MarianTokenizer
 
 #  Импорт изменен чтобы исключить sys.path.append
-from src.utils.data import get_data_from_database
-from src.utils.text import clean_text, tokenize_text
+from utils.data import get_data_from_database
+from utils.text import clean_text, tokenize_text
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
