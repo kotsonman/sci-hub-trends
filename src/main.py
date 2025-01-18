@@ -5,19 +5,22 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import torch
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
 
 from transformers import T5Tokenizer, T5ForConditionalGeneration, MarianMTModel, MarianTokenizer
 
-#  Импорт изменен чтобы исключить sys.path.append
+# Импорт изменен, чтобы исключить sys.path.append
 from utils.data import get_data_from_database
 from utils.text import clean_text, tokenize_text
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 def vectorize_text(titles, max_features):
     """Векторизация текста с помощью TF-IDF."""
@@ -69,34 +72,38 @@ def get_cluster_keywords(vectorizer, vectors, clusters, titles, n_keywords):
     return keywords
 
 
-def translate_text(texts, translator_model, translator_tokenizer):
+def translate_text(texts, translator_model, translator_tokenizer, device, batch_size=32):
     """Перевод текста с использованием MarianMT."""
     translated_texts = []
-    for text in texts:
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
         try:
-            input_ids = translator_tokenizer.encode(text, return_tensors="pt")
-            outputs = translator_model.generate(input_ids, max_new_tokens=50)
-            translated_text = translator_tokenizer.decode(outputs[0], skip_special_tokens=True)
-            translated_texts.append(translated_text)
+            with torch.inference_mode():
+                inputs = translator_tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=512)
+                inputs = {k: v.to(device) for k, v in inputs.items()}  # Перемещаем входные данные на GPU
+                outputs = translator_model.generate(**inputs, max_new_tokens=100)
+                translated_batch = [translator_tokenizer.decode(out, skip_special_tokens=True) for out in outputs]
+                translated_texts.extend(translated_batch)
         except Exception as e:
-             logging.error(f"Error translating text: {text}. Error: {e}")
-             translated_texts.append(text)  # Сохраняем исходный текст при ошибке
+            logging.error(f"Error translating batch: {batch}. Error: {e}")
+            translated_texts.extend(batch)  # Сохраняем исходный текст при ошибке
     return translated_texts
 
-def get_cluster_name(cluster_titles, cluster_keywords, tokenizer, model, translator_model, translator_tokenizer, num_titles=10):
+
+def get_cluster_name(cluster_titles, cluster_keywords, tokenizer, model, device, num_titles=10):
     """Определение имени кластера с помощью Flan-T5."""
     try:
         # Случайный выбор заголовков
         sample_titles = np.random.choice(cluster_titles, size=min(num_titles, len(cluster_titles)), replace=False)
-        translated_titles = translate_text(sample_titles, translator_model, translator_tokenizer)
 
         # Добавляем ключевые слова в промпт
         keywords_str = ", ".join(cluster_keywords)
-        prompt = f"Определи тему кластера научных статей, основываясь на следующих названиях и ключевых словах: {', '.join(translated_titles)}. Ключевые слова: {keywords_str}"
+        prompt = f"Define the topic of a cluster of scientific articles based on the following titles and keywords: {', '.join(sample_titles)}. Keywords: {keywords_str}"
 
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-        outputs = model.generate(input_ids, max_new_tokens=70)  # Увеличиваем max_new_tokens
-        cluster_name = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        with torch.inference_mode():
+            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)  # Перемещаем входные данные на GPU
+            outputs = model.generate(input_ids, max_new_tokens=70)
+            cluster_name = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
         # Пост-обработка для удаления дубликатов
         cluster_name = " ".join(list(dict.fromkeys(cluster_name.split())))
@@ -105,9 +112,17 @@ def get_cluster_name(cluster_titles, cluster_keywords, tokenizer, model, transla
         logging.error(f"Error in get_cluster_name: {e}")
         return "Error generating name"
 
+def find_optimal_batch_size(titles, translator_model, translator_tokenizer, device):
+    """Подбор оптимального размера пакета."""
+    best_batch_size = 128  # Начальное значение
+    return best_batch_size
 
-def main(db_path, output_file, num_clusters, max_features, n_keywords, visualize):
+def main(db_path, output_file, num_clusters, max_features, n_keywords, visualize, num_records=14000):
     """Основная функция для кластеризации и анализа статей."""
+
+    # Определяем устройство (GPU или CPU)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
 
     # Проверяем, есть ли уже файл с результатами
     if os.path.exists(output_file):
@@ -121,9 +136,28 @@ def main(db_path, output_file, num_clusters, max_features, n_keywords, visualize
         return
 
     titles = get_data_from_database(db_path)
+    if not titles:
+        logging.error("No titles found in the database.")
+        return
+
+    # Ограничиваем количество записей
+    titles = titles[:num_records]
+    logging.info(f"Processing {len(titles)} titles.")
+
+    # Загрузка модели и токенизатора для перевода
+    translator_model_name = "Helsinki-NLP/opus-mt-ru-en"
+    translator_tokenizer = MarianTokenizer.from_pretrained(translator_model_name)
+    translator_model = MarianMTModel.from_pretrained(translator_model_name).to(device)  # Перемещаем модель на GPU
+
+    # Подбор оптимального размера пакета
+    optimal_batch_size = find_optimal_batch_size(titles, translator_model, translator_tokenizer, device)
+
+    # Перевод заголовков на английский
+    logging.info("Translating titles to English...")
+    translated_titles = translate_text(titles, translator_model, translator_tokenizer, device, optimal_batch_size)
 
     # Предобработка текста
-    cleaned_titles = [clean_text(title) for title in titles]
+    cleaned_titles = [clean_text(title) for title in translated_titles]
     tokenized_titles = [tokenize_text(title) for title in cleaned_titles]
 
     # Векторизация текста
@@ -133,24 +167,21 @@ def main(db_path, output_file, num_clusters, max_features, n_keywords, visualize
     clusters = cluster_titles(vectors, num_clusters=num_clusters)
 
     # Визуализация (опционально)
-    if visualize :
-        visualize_clusters(vectors, clusters, titles)
+    if visualize:
+        visualize_clusters(vectors, clusters, translated_titles)
 
     # Ключевые слова для кластеров
-    cluster_keywords = get_cluster_keywords(vectorizer, vectors, clusters, titles, n_keywords)
+    cluster_keywords = get_cluster_keywords(vectorizer, vectors, clusters, translated_titles,
+                                            n_keywords)  # Передаем translated_titles
 
-    # Загрузка модели и токенизатора
+    # Загрузка модели и токенизатора для генерации имен кластеров
     model_name = "google/flan-t5-base"
     tokenizer = T5Tokenizer.from_pretrained(model_name)
-    model = T5ForConditionalGeneration.from_pretrained(model_name)
+    model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)  # Перемещаем модель на GPU
 
-    translator_model_name = "Helsinki-NLP/opus-mt-ru-en"
-    translator_tokenizer = MarianTokenizer.from_pretrained(translator_model_name)
-    translator_model = MarianMTModel.from_pretrained(translator_model_name)
-    
     results = {}
     for cluster_num, data in cluster_keywords.items():
-        cluster_name = get_cluster_name(data['titles'], data['keywords'], tokenizer, model, translator_model, translator_tokenizer)
+        cluster_name = get_cluster_name(data['titles'], data['keywords'], tokenizer, model, device)
         results[cluster_name] = {
             "keywords": data['keywords'],
             "titles": data['titles']
@@ -158,7 +189,7 @@ def main(db_path, output_file, num_clusters, max_features, n_keywords, visualize
         print(f"Cluster {cluster_name}:")
         print(f"  Keywords: {', '.join(data['keywords'])}")
         print("-" * 20)
-        
+
     # Сохраняем результаты в файл
     print(f"Saving cluster results to {output_file}...")
     with open(output_file, "w") as f:
@@ -174,6 +205,6 @@ if __name__ == '__main__':
     parser.add_argument("--n_keywords", type=int, default=5, help="Number of keywords per cluster.")
     parser.add_argument("--visualize", action="store_true", help="Visualize clusters.")
 
-    args = parser.parse_args()  # Получаем аргументы командной строки
+    args = parser.parse_args()
 
     main(args.db_path, args.output_file, args.num_clusters, args.max_features, args.n_keywords, args.visualize)
